@@ -26,6 +26,8 @@ use extra::getopts;
 use extra::arc::MutexArc;
 use extra::arc::RWArc;
 
+mod gash;
+
 static SERVER_NAME : &'static str = "Zhtta Version 0.5";
 
 static IP : &'static str = "127.0.0.1";
@@ -181,7 +183,6 @@ impl WebServer {
         stream.write(msg.as_bytes());
     }
 
-    // TODO: Safe visitor counter.
     fn respond_with_counter_page(stream: Option<std::io::net::tcp::TcpStream>, visitorcount: uint) {
         let mut stream = stream;
         let response: ~str = 
@@ -205,7 +206,17 @@ impl WebServer {
     // TODO: Server-side gashing.
     fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
         // for now, just serve as static file
-        WebServer::respond_with_static_file(stream, path);
+        let mut stream = stream;
+        let mut file_reader = File::open(path).expect("Invalid file!");
+        let original_html = file_reader.read_to_str();
+        let startindex = original_html.find_str("<!--#exec cmd=\"").unwrap();
+        let endindex = original_html.find_str("\" -->").unwrap();
+        let cmd = original_html.slice( startindex + 15, endindex);
+        let run_result = gash::run_cmdline(cmd);
+        let mut output_html = original_html.slice_to(startindex).to_owned();
+        output_html = output_html.append(run_result);
+        output_html = output_html.append(original_html.slice_from(endindex + 5).to_owned());
+        stream.write(output_html.as_bytes());
     }
     
     // TODO: Smarter Scheduling.
