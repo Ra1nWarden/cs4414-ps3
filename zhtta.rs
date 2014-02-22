@@ -24,6 +24,7 @@ use std::hashmap::HashMap;
 
 use extra::getopts;
 use extra::arc::MutexArc;
+use extra::arc::RWArc;
 
 static SERVER_NAME : &'static str = "Zhtta Version 0.5";
 
@@ -34,14 +35,13 @@ static WWW_DIR : &'static str = "./www";
 static HTTP_OK : &'static str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n";
 static HTTP_BAD : &'static str = "HTTP/1.1 404 Not Found\r\n\r\n";
 
+
 static COUNTER_STYLE : &'static str = "<doctype !html><html><head><title>Hello, Rust!</title>
              <style>body { background-color: #884414; color: #FFEEAA}
                     h1 { font-size:2cm; text-align: center; color: black; text-shadow: 0 0 4mm red }
                     h2 { font-size:2cm; text-align: center; color: black; text-shadow: 0 0 4mm green }
              </style></head>
              <body>";
-
-static mut visitor_count : uint = 0;
 
 struct HTTP_Request {
     // Use peer_name as the key to access TcpStream in hashmap. 
@@ -62,6 +62,8 @@ struct WebServer {
     
     notify_port: Port<()>,
     shared_notify_chan: SharedChan<()>,
+
+    visitor_count: RWArc<uint>,
 }
 
 impl WebServer {
@@ -79,7 +81,9 @@ impl WebServer {
             stream_map_arc: MutexArc::new(HashMap::new()),
             
             notify_port: notify_port,
-            shared_notify_chan: shared_notify_chan,        
+            shared_notify_chan: shared_notify_chan,
+            
+            visitor_count: RWArc::new(0),
         }
     }
     
@@ -95,22 +99,31 @@ impl WebServer {
         let request_queue_arc = self.request_queue_arc.clone();
         let shared_notify_chan = self.shared_notify_chan.clone();
         let stream_map_arc = self.stream_map_arc.clone();
-                
+       
+        let (visitor_port, visitor_chan) = Chan::new();
+        visitor_chan.send(self.visitor_count.clone());
+
         spawn(proc() {
             let mut acceptor = net::tcp::TcpListener::bind(addr).listen();
             println!("{:s} listening on {:s} (serving from: {:s}).", 
                      SERVER_NAME, addr.to_str(), www_dir_path_str);
             
+            let local_copy = visitor_port.recv();
+                
             for stream in acceptor.incoming() {
                 let (queue_port, queue_chan) = Chan::new();
                 queue_chan.send(request_queue_arc.clone());
                 
                 let notify_chan = shared_notify_chan.clone();
                 let stream_map_arc = stream_map_arc.clone();
+
+                let (next_visitor_port, next_visitor_chan) = Chan::new();
+                next_visitor_chan.send(local_copy.clone());
                 
                 // Spawn a task to handle the connection.
                 spawn(proc() {
-                    unsafe { visitor_count += 1; } // TODO: Fix unsafe counter
+                    let another_local_copy = next_visitor_port.recv();
+                    another_local_copy.write(|number| { *number += 1 });
                     let request_queue_arc = queue_port.recv();
                   
                     let mut stream = stream;
@@ -139,7 +152,8 @@ impl WebServer {
                              
                         if path_str == ~"./" {
                             debug!("===== Counter Page request =====");
-                            WebServer::respond_with_counter_page(stream);
+                            let visitorno = another_local_copy.read(|number| { *number });
+                            WebServer::respond_with_counter_page(stream, visitorno);
                             debug!("=====Terminated connection from [{:s}].=====", peer_name);
                         } else if !path_obj.exists() || path_obj.is_dir() {
                             debug!("===== Error page request =====");
@@ -168,13 +182,13 @@ impl WebServer {
     }
 
     // TODO: Safe visitor counter.
-    fn respond_with_counter_page(stream: Option<std::io::net::tcp::TcpStream>) {
+    fn respond_with_counter_page(stream: Option<std::io::net::tcp::TcpStream>, visitorcount: uint) {
         let mut stream = stream;
         let response: ~str = 
             format!("{:s}{:s}<h1>Greetings, Krusty!</h1>
                      <h2>Visitor count: {:u}</h2></body></html>\r\n", 
                     HTTP_OK, COUNTER_STYLE, 
-                    unsafe { visitor_count } );
+                    visitorcount);
         debug!("Responding to counter request");
         stream.write(response.as_bytes());
     }
