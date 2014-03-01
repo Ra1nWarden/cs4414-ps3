@@ -25,6 +25,7 @@ use std::hashmap::HashMap;
 use extra::getopts;
 use extra::arc::MutexArc;
 use extra::arc::RWArc;
+use extra::sync::Semaphore;
 
 mod gash;
 
@@ -33,6 +34,7 @@ static SERVER_NAME : &'static str = "Zhtta Version 0.5";
 static IP : &'static str = "127.0.0.1";
 static PORT : uint = 4414;
 static WWW_DIR : &'static str = "./www";
+static TASKS : int = 4;
 
 static HTTP_OK : &'static str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n";
 static HTTP_BAD : &'static str = "HTTP/1.1 404 Not Found\r\n\r\n";
@@ -66,14 +68,16 @@ struct WebServer {
     shared_notify_chan: SharedChan<()>,
 
     visitor_count: RWArc<uint>,
+
+    req_handling_tasks: Semaphore,
 }
 
 impl WebServer {
-    fn new(ip: &str, port: uint, www_dir: &str) -> WebServer {
+    fn new(ip: &str, port: uint, www_dir: &str, tasks: int) -> WebServer {
         let (notify_port, shared_notify_chan) = SharedChan::new();
         let www_dir_path = ~Path::new(www_dir);
         os::change_dir(www_dir_path.clone());
-
+       
         WebServer {
             ip: ip.to_owned(),
             port: port,
@@ -86,6 +90,8 @@ impl WebServer {
             shared_notify_chan: shared_notify_chan,
             
             visitor_count: RWArc::new(0),
+
+            req_handling_tasks: Semaphore::new(tasks),
         }
     }
     
@@ -215,7 +221,6 @@ impl WebServer {
         let mut output_html = original_html.slice_to(startindex).to_owned();
         output_html = output_html.append(run_result);
         output_html = output_html.append(original_html.slice_from(endindex + 5).to_owned());
-        println!("reached here!");
         stream.write(HTTP_OK.as_bytes());
         stream.write(output_html.as_bytes());
     }
@@ -308,10 +313,20 @@ impl WebServer {
             }
             
             // TODO: Spawning more tasks to respond the dequeued requests concurrently. You may need a semophore to control the concurrency.
-            let stream = stream_port.recv();
-            WebServer::respond_with_static_file(stream, request.path);
-            // Close stream automatically.
-            debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
+            
+            self.req_handling_tasks.acquire();
+            let (semaphore_port, semaphore_chan) = Chan::new();
+            semaphore_chan.send(self.req_handling_tasks.clone());
+            spawn(proc() {
+                println!("spawning a task!");
+                let req_tasks = semaphore_port.recv();
+                req_tasks.access(|| {        
+                    let stream = stream_port.recv();
+                    WebServer::respond_with_static_file(stream, request.path);
+                });
+                req_tasks.release();
+                debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
+            });
         }
     }
     
@@ -328,12 +343,13 @@ impl WebServer {
     }
 }
 
-fn get_args() -> (~str, uint, ~str) {
+fn get_args() -> (~str, uint, ~str, int) {
     fn print_usage(program: &str) {
         println!("Usage: {:s} [options]", program);
         println!("--ip     \tIP address, \"{:s}\" by default.", IP);
         println!("--port   \tport number, \"{:u}\" by default.", PORT);
-        println!("--www    \tworking directory, \"{:s}\" by default", WWW_DIR);
+        println!("--www    \tworking directory, \"{:s}\" by default.", WWW_DIR);
+        println!("--task   \tnumber of tasks for handling requests, \"{:d}\" by default.", TASKS);
         println("-h --help \tUsage");
     }
     
@@ -345,6 +361,7 @@ fn get_args() -> (~str, uint, ~str) {
         getopts::optopt("ip"),
         getopts::optopt("port"),
         getopts::optopt("www"),
+        getopts::optopt("task"),
         getopts::optflag("h"),
         getopts::optflag("help")
     ];
@@ -374,12 +391,18 @@ fn get_args() -> (~str, uint, ~str) {
     let www_dir_str = if matches.opt_present("www") {
                         matches.opt_str("www").expect("invalid www argument?") 
                       } else { WWW_DIR.to_owned() };
+
+    let tasks:int = if matches.opt_present("task") {
+                         from_str::from_str(matches.opt_str("task").expect("invalid task number?")).expect("not uint?")
+                     } else {
+                        TASKS
+                     };
     
-    (ip_str, port, www_dir_str)
+    (ip_str, port, www_dir_str, tasks)
 }
 
 fn main() {
-    let (ip_str, port, www_dir_str) = get_args();
-    let mut zhtta = WebServer::new(ip_str, port, www_dir_str);
+    let (ip_str, port, www_dir_str, tasks) = get_args();
+    let mut zhtta = WebServer::new(ip_str, port, www_dir_str, tasks);
     zhtta.run();
 }
