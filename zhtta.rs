@@ -210,11 +210,13 @@ impl WebServer {
         let original_html = file_reader.read_to_str();
         let startindex = original_html.find_str("<!--#exec cmd=\"").unwrap();
         let endindex = original_html.find_str("\" -->").unwrap();
-        let cmd = original_html.slice( startindex + 15, endindex);
+        let cmd = original_html.slice(startindex + 15, endindex);
         let run_result = gash::run_cmdline(cmd);
         let mut output_html = original_html.slice_to(startindex).to_owned();
         output_html = output_html.append(run_result);
         output_html = output_html.append(original_html.slice_from(endindex + 5).to_owned());
+        println!("reached here!");
+        stream.write(HTTP_OK.as_bytes());
         stream.write(output_html.as_bytes());
     }
     
