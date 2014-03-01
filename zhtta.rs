@@ -209,7 +209,9 @@ impl WebServer {
         let mut stream = stream;
         let mut file_reader = File::open(path).expect("Invalid file!");
         stream.write(HTTP_OK.as_bytes());
-        stream.write(file_reader.read_to_end());
+        let file_size : u64 = std::io::fs::stat(path).size;
+        let size_in_byte : uint = file_size.to_uint().unwrap()/8;
+        stream.write(file_reader.read_bytes(size_in_byte));
     }
     
     fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
