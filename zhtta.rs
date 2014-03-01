@@ -17,6 +17,7 @@
 extern mod extra;
 
 use std::io::*;
+use std::io::fs::stat;
 use std::io::net::ip::{SocketAddr};
 use std::{os, str, libc, from_str};
 use std::path::Path;
@@ -34,7 +35,7 @@ static SERVER_NAME : &'static str = "Zhtta Version 0.5";
 static IP : &'static str = "127.0.0.1";
 static PORT : uint = 4414;
 static WWW_DIR : &'static str = "./www";
-static TASKS : int = 4;
+static TASKS : int = 8;
 
 static HTTP_OK : &'static str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n";
 static HTTP_BAD : &'static str = "HTTP/1.1 404 Not Found\r\n\r\n";
@@ -54,6 +55,7 @@ struct HTTP_Request {
     //  See issue: https://github.com/mozilla/rust/issues/12139)
     peer_name: ~str,
     path: ~Path,
+    size: u64,
 }
 
 struct WebServer {
@@ -240,7 +242,7 @@ impl WebServer {
             });
         }
         // Enqueue the HTTP request.
-        let req = HTTP_Request { peer_name: peer_name.clone(), path: ~path_obj.clone() };
+        let req = HTTP_Request { peer_name: peer_name.clone(), path: ~path_obj.clone(), size: std::io::fs::stat(path_obj).size };
         let (req_port, req_chan) = Chan::new();
         req_chan.send(req);
 
@@ -255,8 +257,8 @@ impl WebServer {
                     ("137", "54") => true,
                     _ => false,
             };
+            let mut insert_index = local_req_queue.len();
             if priority {
-                    let mut insert_index = local_req_queue.len();
                     for i in range(0, local_req_queue.len()) {
                         let this_ip : ~str = local_req_queue[i].peer_name.clone();
                         let ip_vec : ~[&str] = this_ip.split('.').collect();
@@ -266,17 +268,22 @@ impl WebServer {
                             _ => break,
                         }
                     };
-                    local_req_queue.insert(insert_index, req);
-                    debug!("A new request enqueued, now the length of queue is {:u}.", local_req_queue.len())
             }
-            else {
-                   local_req_queue.push(req);
+            while insert_index != 0 {
+                let prev_file_size = local_req_queue[insert_index - 1].size;
+                if req.size < prev_file_size {
+                    insert_index -= 1;
+                }
+                else {
+                    break;
+                }
             }
+            local_req_queue.insert(insert_index, req);
+            debug!("A new request enqueued, now the length of queue is {:u}.", local_req_queue.len());
         });
         
         notify_chan.send(()); // Send incoming notification to responder task.
-    
-    
+     
     }
     
     // TODO: Smarter Scheduling.
@@ -318,7 +325,6 @@ impl WebServer {
             let (semaphore_port, semaphore_chan) = Chan::new();
             semaphore_chan.send(self.req_handling_tasks.clone());
             spawn(proc() {
-                println!("spawning a task!");
                 let req_tasks = semaphore_port.recv();
                 req_tasks.access(|| {        
                     let stream = stream_port.recv();
