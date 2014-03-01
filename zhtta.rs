@@ -131,9 +131,10 @@ impl WebServer {
                     let mut stream = stream;
                     
                     let peer_name = WebServer::get_peer_name(&mut stream);
-                    
-                    let mut buf = [0, ..500];
+                            
+                    let mut buf = [0, ..800];
                     stream.read(buf);
+                   
                     let request_str = str::from_utf8(buf);
                     debug!("Request:\n{:s}", request_str);
                     
@@ -203,9 +204,7 @@ impl WebServer {
         stream.write(file_reader.read_to_end());
     }
     
-    // TODO: Server-side gashing.
     fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
-        // for now, just serve as static file
         let mut stream = stream;
         let mut file_reader = File::open(path).expect("Invalid file!");
         let original_html = file_reader.read_to_str();
@@ -233,7 +232,6 @@ impl WebServer {
                 local_stream_map.swap(peer_name.clone(), stream);
             });
         }
-        
         // Enqueue the HTTP request.
         let req = HTTP_Request { peer_name: peer_name.clone(), path: ~path_obj.clone() };
         let (req_port, req_chan) = Chan::new();
@@ -243,8 +241,30 @@ impl WebServer {
         req_queue_arc.access(|local_req_queue| {
             debug!("Got queue mutex lock.");
             let req: HTTP_Request = req_port.recv();
-            local_req_queue.push(req);
-            debug!("A new request enqueued, now the length of queue is {:u}.", local_req_queue.len());
+            let add_ip = req.peer_name.clone();
+            let current_start_ip: ~[&str] = add_ip.split('.').collect();
+            let priority = match (current_start_ip[0], current_start_ip[1]) {
+                    ("128", "143") => true,
+                    ("137", "54") => true,
+                    _ => false,
+            };
+            if priority {
+                    let mut insert_index = local_req_queue.len();
+                    for i in range(0, local_req_queue.len()) {
+                        let this_ip : ~str = local_req_queue[i].peer_name.clone();
+                        let ip_vec : ~[&str] = this_ip.split('.').collect();
+                        match (ip_vec[0], ip_vec[1]) {
+                            ("128", "143") => insert_index = i+1,
+                            ("137", "54") => insert_index = i+1,
+                            _ => break,
+                        }
+                    };
+                    local_req_queue.insert(insert_index, req);
+                    debug!("A new request enqueued, now the length of queue is {:u}.", local_req_queue.len())
+            }
+            else {
+                   local_req_queue.push(req);
+            }
         });
         
         notify_chan.send(()); // Send incoming notification to responder task.
