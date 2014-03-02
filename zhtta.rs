@@ -36,6 +36,7 @@ static IP : &'static str = "127.0.0.1";
 static PORT : uint = 4414;
 static WWW_DIR : &'static str = "./www";
 static TASKS : int = 8;
+static CACHE : uint = 2;
 
 static HTTP_OK : &'static str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n";
 static HTTP_BAD : &'static str = "HTTP/1.1 404 Not Found\r\n\r\n";
@@ -72,10 +73,12 @@ struct WebServer {
     visitor_count: RWArc<uint>,
 
     req_handling_tasks: Semaphore,
+
+    cached_pages: MutexArc<HashMap<Path, ~[u8]>>,
 }
 
 impl WebServer {
-    fn new(ip: &str, port: uint, www_dir: &str, tasks: int) -> WebServer {
+    fn new(ip: &str, port: uint, www_dir: &str, tasks: int, cache: uint) -> WebServer {
         let (notify_port, shared_notify_chan) = SharedChan::new();
         let www_dir_path = ~Path::new(www_dir);
         os::change_dir(www_dir_path.clone());
@@ -94,6 +97,8 @@ impl WebServer {
             visitor_count: RWArc::new(0),
 
             req_handling_tasks: Semaphore::new(tasks),
+
+            cached_pages: MutexArc::new(HashMap::with_capacity(cache*10)),
         }
     }
     
@@ -203,15 +208,31 @@ impl WebServer {
         stream.write(response.as_bytes());
     }
     
-    // TODO: Streaming file.
-    // TODO: Application-layer file caching.
-    fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
+    fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>, path: &Path, cached_pages: MutexArc<HashMap<Path, ~[u8]>>) {
         let mut stream = stream;
-        let mut file_reader = File::open(path).expect("Invalid file!");
-        stream.write(HTTP_OK.as_bytes());
-        let file_size : u64 = std::io::fs::stat(path).size;
-        let size_in_byte : uint = file_size.to_uint().unwrap()/8;
-        stream.write(file_reader.read_bytes(size_in_byte));
+        let contains = cached_pages.access(|local_cached_map| {
+            local_cached_map.contains_key(path)
+        });
+        if contains {
+            cached_pages.access(|local_cached_map| {
+                stream.write(HTTP_OK.as_bytes());
+                stream.write(*local_cached_map.find(path).unwrap());
+            });
+            
+        }
+        else {
+            let mut file_reader = File::open(path).expect("Invalid file!");
+            let file_size : u64 = std::io::fs::stat(path).size;
+            let size_in_byte : uint = file_size.to_uint().unwrap()/8;
+            let output_page = file_reader.read_bytes(size_in_byte);
+            if size_in_byte <= 128000 {
+                cached_pages.access(|local_cached_map| {
+                    local_cached_map.insert(path.clone(), output_page.clone());
+                }); 
+            }
+            stream.write(HTTP_OK.as_bytes());
+            stream.write(output_page);
+        }
     }
     
     fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
@@ -229,7 +250,6 @@ impl WebServer {
         stream.write(output_html.as_bytes());
     }
     
-    // TODO: Smarter Scheduling.
     fn enqueue_static_file_request(stream: Option<std::io::net::tcp::TcpStream>, path_obj: &Path, stream_map_arc: MutexArc<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>, req_queue_arc: MutexArc<~[HTTP_Request]>, notify_chan: SharedChan<()>) {
         // Save stream in hashmap for later response.
         let mut stream = stream;
@@ -288,7 +308,6 @@ impl WebServer {
      
     }
     
-    // TODO: Smarter Scheduling.
     fn dequeue_static_file_request(&mut self) {
         let req_queue_get = self.request_queue_arc.clone();
         let stream_map_get = self.stream_map_arc.clone();
@@ -321,16 +340,18 @@ impl WebServer {
                 });
             }
             
-            // TODO: Spawning more tasks to respond the dequeued requests concurrently. You may need a semophore to control the concurrency.
-            
             self.req_handling_tasks.acquire();
             let (semaphore_port, semaphore_chan) = Chan::new();
+            let (cached_port, cached_chan) = Chan::new();
+            let mutable_map = self.cached_pages.clone();
+            cached_chan.send(mutable_map);
             semaphore_chan.send(self.req_handling_tasks.clone());
             spawn(proc() {
                 let req_tasks = semaphore_port.recv();
                 req_tasks.access(|| {        
                     let stream = stream_port.recv();
-                    WebServer::respond_with_static_file(stream, request.path);
+                    let cached_map = cached_port.recv();
+                    WebServer::respond_with_static_file(stream, request.path, cached_map);
                 });
                 req_tasks.release();
                 debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
@@ -351,13 +372,14 @@ impl WebServer {
     }
 }
 
-fn get_args() -> (~str, uint, ~str, int) {
+fn get_args() -> (~str, uint, ~str, int, uint) {
     fn print_usage(program: &str) {
         println!("Usage: {:s} [options]", program);
         println!("--ip     \tIP address, \"{:s}\" by default.", IP);
         println!("--port   \tport number, \"{:u}\" by default.", PORT);
         println!("--www    \tworking directory, \"{:s}\" by default.", WWW_DIR);
         println!("--task   \tnumber of tasks for handling requests, \"{:d}\" by default.", TASKS);
+        println!("--cache  \tsize of cache in MB for pages, \"{:u}\" by default.", CACHE);
         println("-h --help \tUsage");
     }
     
@@ -370,6 +392,7 @@ fn get_args() -> (~str, uint, ~str, int) {
         getopts::optopt("port"),
         getopts::optopt("www"),
         getopts::optopt("task"),
+        getopts::optopt("cache"),
         getopts::optflag("h"),
         getopts::optflag("help")
     ];
@@ -406,11 +429,17 @@ fn get_args() -> (~str, uint, ~str, int) {
                         TASKS
                      };
     
-    (ip_str, port, www_dir_str, tasks)
+    let cache:uint = if matches.opt_present("cache") {
+                         from_str::from_str(matches.opt_str("cache").expect("invalid cache size?")).expect("not uint?")
+                    } else {
+                       CACHE
+                    };
+    
+    (ip_str, port, www_dir_str, tasks, cache)
 }
 
 fn main() {
-    let (ip_str, port, www_dir_str, tasks) = get_args();
-    let mut zhtta = WebServer::new(ip_str, port, www_dir_str, tasks);
+    let (ip_str, port, www_dir_str, tasks, cache) = get_args();
+    let mut zhtta = WebServer::new(ip_str, port, www_dir_str, tasks, cache);
     zhtta.run();
 }
