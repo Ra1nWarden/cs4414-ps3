@@ -223,7 +223,7 @@ impl WebServer {
         else {
             let mut file_reader = File::open(path).expect("Invalid file!");
             let file_size : u64 = std::io::fs::stat(path).size;
-            let size_in_byte : uint = file_size.to_uint().unwrap()/8;
+            let size_in_byte : uint = file_size.to_uint().unwrap();
             let output_page = file_reader.read_bytes(size_in_byte);
             if size_in_byte <= 128000 {
                 cached_pages.access(|local_cached_map| {
