@@ -75,6 +75,8 @@ struct WebServer {
     req_handling_tasks: Semaphore,
 
     cached_pages: MutexArc<HashMap<Path, ~[u8]>>,
+
+    cached_threshold: uint,
 }
 
 impl WebServer {
@@ -98,7 +100,9 @@ impl WebServer {
 
             req_handling_tasks: Semaphore::new(tasks),
 
-            cached_pages: MutexArc::new(HashMap::with_capacity(cache*10)),
+            cached_pages: MutexArc::new(HashMap::new()),
+
+            cached_threshold: cache * 1000000,
         }
     }
     
@@ -117,6 +121,12 @@ impl WebServer {
        
         let (visitor_port, visitor_chan) = Chan::new();
         visitor_chan.send(self.visitor_count.clone());
+        
+        let (cached_pages_port, cached_pages_chan) = Chan::new();
+        cached_pages_chan.send(self.cached_pages.clone());
+
+        let (semaphore_port, semaphore_chan) = Chan::new();
+        semaphore_chan.send(self.req_handling_tasks.clone());
 
         spawn(proc() {
             let mut acceptor = net::tcp::TcpListener::bind(addr).listen();
@@ -124,7 +134,9 @@ impl WebServer {
                      SERVER_NAME, addr.to_str(), www_dir_path_str);
             
             let local_copy = visitor_port.recv();
-                
+            let local_cached_pages = cached_pages_port.recv();
+            let local_semaphore = semaphore_port.recv();
+    
             for stream in acceptor.incoming() {
                 let (queue_port, queue_chan) = Chan::new();
                 queue_chan.send(request_queue_arc.clone());
@@ -135,6 +147,12 @@ impl WebServer {
                 let (next_visitor_port, next_visitor_chan) = Chan::new();
                 next_visitor_chan.send(local_copy.clone());
                 
+                let (next_cache_map_port, next_cache_map_chan) = Chan::new();
+                next_cache_map_chan.send(local_cached_pages.clone());
+
+                let (next_sem_port, next_sem_chan) = Chan::new();
+                next_sem_chan.send(local_semaphore.clone());
+
                 // Spawn a task to handle the connection.
                 spawn(proc() {
                     let another_local_copy = next_visitor_port.recv();
@@ -181,7 +199,35 @@ impl WebServer {
                             debug!("=====Terminated connection from [{:s}].=====", peer_name);
                         } else { 
                             debug!("===== Static Page request =====");
-                            WebServer::enqueue_static_file_request(stream, path_obj, stream_map_arc, request_queue_arc, notify_chan);
+                            let local_sem = next_sem_port.recv();
+                            let local_map_copy = next_cache_map_port.recv();
+                            let mapcontains = local_map_copy.access(|local_cached_map| {
+                                local_cached_map.contains_key(path_obj)
+                            });
+                            if mapcontains {
+                                 local_sem.acquire();
+                                 let (send_sem_port, send_sem_chan) = Chan::new();
+                                 send_sem_chan.send(local_sem.clone());
+                                 let (send_stream_port, send_stream_chan) = Chan::new();
+                                 send_stream_chan.send(stream);
+                                 let (send_path_port, send_path_chan) = Chan::new();
+                                 send_path_chan.send(path_obj.clone());
+                                 spawn(proc() {
+                                      let this_sem = send_sem_port.recv();
+                                      let mut this_stream = send_stream_port.recv();
+                                      let this_path = send_path_port.recv();
+                                      this_sem.access(|| {
+                                          local_map_copy.access(|local_cached_map| {
+                                              this_stream.write(HTTP_OK.as_bytes());
+                                              this_stream.write(*local_cached_map.find(this_path).unwrap());
+                                          });
+                                      });
+                                      this_sem.release();
+                                  });              
+                            }
+                            else {
+                                 WebServer::enqueue_static_file_request(stream, path_obj, stream_map_arc, request_queue_arc, notify_chan);
+                            }
                         }
                     }
                 });
@@ -208,12 +254,12 @@ impl WebServer {
         stream.write(response.as_bytes());
     }
     
-    fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>, path: &Path, cached_pages: MutexArc<HashMap<Path, ~[u8]>>) {
+    fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>, path: &Path, cached_pages: MutexArc<HashMap<Path, ~[u8]>>, cache_thresh: uint) {
         let mut stream = stream;
-        let contains = cached_pages.access(|local_cached_map| {
+        let mapcontains = cached_pages.access(|local_cached_map| {
             local_cached_map.contains_key(path)
         });
-        if contains {
+        if mapcontains {
             cached_pages.access(|local_cached_map| {
                 stream.write(HTTP_OK.as_bytes());
                 stream.write(*local_cached_map.find(path).unwrap());
@@ -225,7 +271,8 @@ impl WebServer {
             let file_size : u64 = std::io::fs::stat(path).size;
             let size_in_byte : uint = file_size.to_uint().unwrap();
             let output_page = file_reader.read_bytes(size_in_byte);
-            if size_in_byte <= 128000 {
+            if size_in_byte <= cache_thresh {
+                println!("caching {:u}", size_in_byte);
                 cached_pages.access(|local_cached_map| {
                     local_cached_map.insert(path.clone(), output_page.clone());
                 }); 
@@ -343,15 +390,18 @@ impl WebServer {
             self.req_handling_tasks.acquire();
             let (semaphore_port, semaphore_chan) = Chan::new();
             let (cached_port, cached_chan) = Chan::new();
+            let (thresh_port, thresh_chan) = Chan::new();
             let mutable_map = self.cached_pages.clone();
             cached_chan.send(mutable_map);
+            thresh_chan.send(self.cached_threshold.clone());
             semaphore_chan.send(self.req_handling_tasks.clone());
             spawn(proc() {
                 let req_tasks = semaphore_port.recv();
                 req_tasks.access(|| {        
                     let stream = stream_port.recv();
                     let cached_map = cached_port.recv();
-                    WebServer::respond_with_static_file(stream, request.path, cached_map);
+                    let cache_thresh = thresh_port.recv();
+                    WebServer::respond_with_static_file(stream, request.path, cached_map, cache_thresh);
                 });
                 req_tasks.release();
                 debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
