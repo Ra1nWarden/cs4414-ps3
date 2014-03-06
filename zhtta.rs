@@ -270,15 +270,26 @@ impl WebServer {
             let mut file_reader = File::open(path).expect("Invalid file!");
             let file_size : u64 = std::io::fs::stat(path).size;
             let size_in_byte : uint = file_size.to_uint().unwrap();
-            let output_page = file_reader.read_bytes(size_in_byte);
+            let mut output_page : ~[u8] = ~[];
+           
+            stream.write(HTTP_OK.as_bytes());
+            let mut size_remaining = size_in_byte;
+            while size_remaining > 256 {
+                let write_bytes = file_reader.read_bytes(256);
+                output_page = std::vec::append(output_page, write_bytes);
+                stream.write(write_bytes);
+                size_remaining -= 256;
+            }
+            let write_bytes = file_reader.read_bytes(size_remaining);
+            output_page = std::vec::append(output_page, write_bytes);
+            stream.write(write_bytes);
+            
             if size_in_byte <= cache_thresh {
                 println!("caching {:u}", size_in_byte);
                 cached_pages.access(|local_cached_map| {
                     local_cached_map.insert(path.clone(), output_page.clone());
                 }); 
             }
-            stream.write(HTTP_OK.as_bytes());
-            stream.write(output_page);
         }
     }
     
