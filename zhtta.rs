@@ -27,6 +27,7 @@ use extra::getopts;
 use extra::arc::MutexArc;
 use extra::arc::RWArc;
 use extra::sync::Semaphore;
+use extra::lru_cache::LruCache;
 
 mod gash;
 
@@ -74,7 +75,7 @@ struct WebServer {
 
     req_handling_tasks: Semaphore,
 
-    cached_pages: MutexArc<HashMap<Path, ~[u8]>>,
+    cached_pages: MutexArc<extra::lru_cache::LruCache<Path, ~[u8]>>,
 
     cached_threshold: uint,
 }
@@ -100,7 +101,7 @@ impl WebServer {
 
             req_handling_tasks: Semaphore::new(tasks),
 
-            cached_pages: MutexArc::new(HashMap::new()),
+            cached_pages: MutexArc::new(LruCache::new(2)),
 
             cached_threshold: cache * 1000000,
         }
@@ -202,7 +203,10 @@ impl WebServer {
                             let local_sem = next_sem_port.recv();
                             let local_map_copy = next_cache_map_port.recv();
                             let mapcontains = local_map_copy.access(|local_cached_map| {
-                                local_cached_map.contains_key(path_obj)
+                                match local_cached_map.get(path_obj) {
+                                     None => false,
+                                     _ => true
+                                }
                             });
                             if mapcontains {
                                  local_sem.acquire();
@@ -219,7 +223,8 @@ impl WebServer {
                                       this_sem.access(|| {
                                           local_map_copy.access(|local_cached_map| {
                                               this_stream.write(HTTP_OK.as_bytes());
-                                              this_stream.write(*local_cached_map.find(this_path).unwrap());
+                                              let output_bytes = local_cached_map.get(this_path).unwrap();
+                                              this_stream.write(*output_bytes);
                                           });
                                       });
                                       this_sem.release();
@@ -254,15 +259,19 @@ impl WebServer {
         stream.write(response.as_bytes());
     }
     
-    fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>, path: &Path, cached_pages: MutexArc<HashMap<Path, ~[u8]>>, cache_thresh: uint) {
+    fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>, path: &Path, cached_pages: MutexArc<extra::lru_cache::LruCache<Path, ~[u8]>>, cache_thresh: uint) {
         let mut stream = stream;
         let mapcontains = cached_pages.access(|local_cached_map| {
-            local_cached_map.contains_key(path)
+            match local_cached_map.get(path) {
+                    None => false,
+                    _ => true
+            }
         });
         if mapcontains {
             cached_pages.access(|local_cached_map| {
                 stream.write(HTTP_OK.as_bytes());
-                stream.write(*local_cached_map.find(path).unwrap());
+                let output_bytes = local_cached_map.get(path).unwrap();
+                stream.write(*output_bytes);
             });
             
         }
@@ -271,23 +280,27 @@ impl WebServer {
             let file_size : u64 = std::io::fs::stat(path).size;
             let size_in_byte : uint = file_size.to_uint().unwrap();
             let mut output_page : ~[u8] = ~[];
+            let to_cache = size_in_byte <= cache_thresh;
            
             stream.write(HTTP_OK.as_bytes());
             let mut size_remaining = size_in_byte;
             while size_remaining > 256 {
                 let write_bytes = file_reader.read_bytes(256);
-                output_page = std::vec::append(output_page, write_bytes);
+                if to_cache {
+                    output_page = std::vec::append(output_page, write_bytes);
+                }
                 stream.write(write_bytes);
-                size_remaining -= 256;
+                size_remaining = size_remaining - 256;
             }
             let write_bytes = file_reader.read_bytes(size_remaining);
-            output_page = std::vec::append(output_page, write_bytes);
+            if to_cache {
+                output_page = std::vec::append(output_page, write_bytes);
+            }
             stream.write(write_bytes);
             
-            if size_in_byte <= cache_thresh {
-                println!("caching {:u}", size_in_byte);
+            if to_cache {
                 cached_pages.access(|local_cached_map| {
-                    local_cached_map.insert(path.clone(), output_page.clone());
+                    local_cached_map.put(path.clone(), output_page.clone());
                 }); 
             }
         }
