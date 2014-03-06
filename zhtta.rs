@@ -293,20 +293,48 @@ impl WebServer {
         }
     }
     
-    fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
-        let mut stream = stream;
-        let mut file_reader = File::open(path).expect("Invalid file!");
-        let original_html = file_reader.read_to_str();
-        let startindex = original_html.find_str("<!--#exec cmd=\"").unwrap();
-        let endindex = original_html.find_str("\" -->").unwrap();
-        let cmd = original_html.slice(startindex + 15, endindex);
-        let run_result = gash::run_cmdline(cmd);
-        let mut output_html = original_html.slice_to(startindex).to_owned();
-        output_html = output_html.append(run_result);
-        output_html = output_html.append(original_html.slice_from(endindex + 5).to_owned());
-        stream.write(HTTP_OK.as_bytes());
-        stream.write(output_html.as_bytes());
-    }
+	fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
+		let mut stream = stream;
+		let mut file_reader = File::open(path).expect("Invalid file!");
+		stream.write(HTTP_OK.as_bytes());
+
+		let file_content_bytes = file_reader.read_to_end();
+		let file_content = str::from_utf8(file_content_bytes);
+		let mut page_content = ~"";
+		let mut s_from = 0;
+
+		let mut has_command = file_content.slice_from(s_from).find_str("<!--#exec");
+		loop {
+			match has_command {
+				Some(s) => {
+					let start = s_from + s;
+					let end = start + file_content.slice_from(start).find_str("-->").expect("comment w/o closing tag");
+					let arg_str = file_content.slice(start + 9, end).trim().to_owned();
+					let has_cmd_arg = arg_str.find_str("cmd=\"");
+					match has_cmd_arg {
+						Some(start1) => {
+							let end1 = arg_str.rfind('\"').expect("string w/o closing tag");
+							let cmd = arg_str.slice(start1 + 5, end1).trim().to_owned();
+							let output = gash::run_cmdline(cmd);
+							page_content = format!("{}{}{}", page_content, file_content.slice(s_from, start), output);
+							s_from = end + 3;
+						},
+						None => {
+							page_content = format!("{}{}", page_content, file_content.slice(s_from, start + 1));
+							s_from = start + 1;
+						}
+					}
+				},
+				None => {
+					page_content = format!("{}{}", page_content, file_content.slice_from(s_from));
+					break;
+				}
+			};
+			has_command = file_content.slice_from(s_from).find_str("<!--#exec");
+		}
+
+		stream.write_str(page_content);
+	}
     
     fn enqueue_static_file_request(stream: Option<std::io::net::tcp::TcpStream>, path_obj: &Path, stream_map_arc: MutexArc<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>, req_queue_arc: MutexArc<~[HTTP_Request]>, notify_chan: SharedChan<()>) {
         // Save stream in hashmap for later response.
