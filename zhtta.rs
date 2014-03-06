@@ -281,16 +281,17 @@ impl WebServer {
             let size_in_byte : uint = file_size.to_uint().unwrap();
             let mut output_page : ~[u8] = ~[];
             let to_cache = size_in_byte <= cache_thresh;
-           
+            let each_time_read = 100000;
+            
             stream.write(HTTP_OK.as_bytes());
             let mut size_remaining = size_in_byte;
-            while size_remaining > 256 {
-                let write_bytes = file_reader.read_bytes(256);
+            while size_remaining > each_time_read {
+                let write_bytes = file_reader.read_bytes(each_time_read);
                 if to_cache {
                     output_page = std::vec::append(output_page, write_bytes);
                 }
                 stream.write(write_bytes);
-                size_remaining = size_remaining - 256;
+                size_remaining = size_remaining - each_time_read;
             }
             let write_bytes = file_reader.read_bytes(size_remaining);
             if to_cache {
